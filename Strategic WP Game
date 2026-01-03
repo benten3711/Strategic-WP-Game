@@ -1,0 +1,1633 @@
+#nullable disable
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Linq;
+using System.Windows.Forms;
+using System.IO;
+
+namespace WaterPoloGame
+{
+    // --- ENUMS ---
+    public enum Phase
+    {
+        MainMenu,
+        Settings,
+        Rules,
+        Roster,
+        Sprint,
+        CAP1_Offense, CAP1_Defense,
+        CAP2_Offense, CAP2_Defense,
+        HalfCourtOffense, HalfCourtDefense,
+        ShootingSelection,
+        Animating,
+        Halftime,
+        Statistics, // End Game Stats
+        ShootoutCoinFlip,
+        ShootoutSetup,
+        ShootoutAim,
+        GameOver
+    }
+
+    public enum Team { Home, Away }
+    public enum HexType { Field, GoalHome, GoalAway, CreaseHome, CreaseAway }
+    public enum GameMode { PvP, PvAI }
+    public enum Difficulty { Easy, Medium, Hard }
+    public enum PressureType { None, Perimeter, InsideWater, Crease, SideBySide }
+    public enum AnimalType { Human, Shark, Gorilla, Bear, Tiger, Croc, Bull, Hippo }
+
+    // --- RENDER OBJECT ---
+    public class Renderable
+    {
+        public float ZIndex;
+        public Action<Graphics> DrawAction;
+    }
+
+    // --- GAME CLASSES ---
+    public class Player
+    {
+        public Team Team { get; set; }
+        public string Name { get; set; }
+        public int Number { get; set; }
+        public int Q { get; set; }
+        public int R { get; set; }
+        public bool IsGoalie { get; set; }
+        public bool HasMoved { get; set; }
+        public int StatsGoals { get; set; } = 0;
+        public int StatsSteals { get; set; } = 0;
+        public int StatsBlocks { get; set; } = 0;
+        public Point Hex => new Point(Q, R);
+
+        public Player(Team team, int number, int q, int r, bool isGoalie = false)
+        {
+            Team = team;
+            Number = number;
+            Name = isGoalie ? "Goalie" : $"Player {number}";
+            Q = q; R = r; IsGoalie = isGoalie;
+        }
+    }
+
+    public class Board
+    {
+        public Dictionary<Point, HexType> Hexes = new Dictionary<Point, HexType>();
+        public List<Player> Players = new List<Player>();
+        public Player BallOwner = null;
+        public List<Point> HomeGoal = new List<Point>();
+        public List<Point> AwayGoal = new List<Point>();
+
+        public Board()
+        {
+            GenerateBoard();
+            // Teams setup is now deferred to StartGame to handle Settings
+        }
+
+        private void GenerateBoard()
+        {
+            for (int q = -5; q <= 5; q++)
+            {
+                int colIndex = q + 6;
+                bool isOddCol = (colIndex % 2 != 0);
+                int r_start = isOddCol ? -4 : -3;
+                int r_end = 3;
+                int r_shift = -(int)Math.Floor(q / 2.0);
+
+                for (int r = r_start; r <= r_end; r++)
+                {
+                    Hexes[new Point(q, r + r_shift)] = HexType.Field;
+                }
+            }
+
+            HomeGoal.Add(new Point(6, -4)); HomeGoal.Add(new Point(6, -3)); HomeGoal.Add(new Point(6, -2));
+            AwayGoal.Add(new Point(-6, 2)); AwayGoal.Add(new Point(-6, 3)); AwayGoal.Add(new Point(-6, 4));
+
+            foreach (var p in HomeGoal) Hexes[p] = HexType.GoalHome;
+            foreach (var p in AwayGoal) Hexes[p] = HexType.GoalAway;
+
+            foreach (var goalHex in HomeGoal) MarkNeighborsAsCrease(goalHex, HexType.CreaseHome);
+            foreach (var goalHex in AwayGoal) MarkNeighborsAsCrease(goalHex, HexType.CreaseAway);
+        }
+
+        private void MarkNeighborsAsCrease(Point p, HexType type)
+        {
+            Point[] dirs = { new Point(1, 0), new Point(1, -1), new Point(0, -1), new Point(-1, 0), new Point(-1, 1), new Point(0, 1) };
+            foreach (var d in dirs)
+            {
+                Point neighbor = new Point(p.X + d.X, p.Y + d.Y);
+                if (Hexes.ContainsKey(neighbor) && Hexes[neighbor] == HexType.Field)
+                    Hexes[neighbor] = type;
+            }
+        }
+
+        public void SetupTeamsForSprint(int teamSize)
+        {
+            Players.Clear();
+            // Goalie
+            Point hGoal = HomeGoal[1];
+            Players.Add(new Player(Team.Home, 1, hGoal.X, hGoal.Y, true));
+            Point aGoal = AwayGoal[1];
+            Players.Add(new Player(Team.Away, 1, aGoal.X, aGoal.Y, true));
+
+            // Field Players
+            int fieldPlayers = teamSize - 1;
+            for (int i = 0; i < fieldPlayers; i++) Players.Add(new Player(Team.Home, i + 2, 5, -4 + i));
+            for (int i = 0; i < fieldPlayers; i++) Players.Add(new Player(Team.Away, i + 2, -5, -1 + i));
+        }
+
+        public void ResetPositionsForSprint(int teamSize)
+        {
+            var home = Players.Where(p => p.Team == Team.Home).ToList();
+            var away = Players.Where(p => p.Team == Team.Away).ToList();
+            Point hGoal = HomeGoal[1];
+            if (home.Count > 0) { home[0].Q = hGoal.X; home[0].R = hGoal.Y; }
+            Point aGoal = AwayGoal[1];
+            if (away.Count > 0) { away[0].Q = aGoal.X; away[0].R = aGoal.Y; }
+
+            int fieldPlayers = teamSize - 1;
+            for (int i = 1; i <= fieldPlayers && i < home.Count; i++) { home[i].Q = 5; home[i].R = -4 + (i - 1); }
+            for (int i = 1; i <= fieldPlayers && i < away.Count; i++) { away[i].Q = -5; away[i].R = -1 + (i - 1); }
+        }
+
+        public void SetupAfterGoalLineup(int teamSize)
+        {
+            var home = Players.Where(p => p.Team == Team.Home).ToList();
+            var away = Players.Where(p => p.Team == Team.Away).ToList();
+            Point hGoal = HomeGoal[1];
+            Point aGoal = AwayGoal[1];
+            if (home.Count > 0) { home[0].Q = hGoal.X; home[0].R = hGoal.Y; }
+            if (away.Count > 0) { away[0].Q = aGoal.X; away[0].R = aGoal.Y; }
+
+            int fieldPlayers = teamSize - 1;
+            for (int i = 1; i <= fieldPlayers && i < home.Count; i++) { home[i].Q = 1; home[i].R = -3 + (i - 1); }
+            for (int i = 1; i <= fieldPlayers && i < away.Count; i++) { away[i].Q = -1; away[i].R = -2 + (i - 1); }
+        }
+
+        public void SetupShootout(Team shooterTeam)
+        {
+            Players.Clear();
+            if (shooterTeam == Team.Home)
+            {
+                Players.Add(new Player(Team.Home, 10, -2, 1));
+                Players.Add(new Player(Team.Away, 1, -6, 3, true));
+            }
+            else
+            {
+                Players.Add(new Player(Team.Away, 10, 2, -1));
+                Players.Add(new Player(Team.Home, 1, 6, -3, true));
+            }
+            BallOwner = Players.First(p => p.Team == shooterTeam);
+        }
+
+        public static int GetHexDist(Point a, Point b)
+        {
+            return (Math.Abs(a.X - b.X) + Math.Abs(a.X + a.Y - b.X - b.Y) + Math.Abs(a.Y - b.Y)) / 2;
+        }
+
+        public Player GetPlayerAt(Point p) => Players.FirstOrDefault(pl => pl.Q == p.X && pl.R == p.Y);
+    }
+
+    // --- MAIN FORM ---
+    public partial class Form1 : Form
+    {
+        private Board board;
+        private Phase currentPhase = Phase.MainMenu;
+        private Phase nextPhaseAfterAnim = Phase.Sprint;
+        private Team turnTeam = Team.Home;
+
+        // Settings Variables
+        private GameMode gameMode = GameMode.PvP;
+        private Difficulty aiDifficulty = Difficulty.Medium;
+        private Team aiTeam = Team.Away;
+        private int settingTeamSize = 7; // Default 7 (6+Goalie)
+        private float settingShotChanceMod = 1.0f; // 1.0 = Normal, 1.2 = High, 0.8 = Low
+        private Rectangle btnTeamSizePlus, btnTeamSizeMinus, btnShotModToggle, btnBackSettings;
+
+        // Statistics Variables
+        private Dictionary<Team, int> statsPasses = new Dictionary<Team, int> { { Team.Home, 0 }, { Team.Away, 0 } };
+        private Dictionary<Team, int> statsShotsTaken = new Dictionary<Team, int> { { Team.Home, 0 }, { Team.Away, 0 } };
+        private Dictionary<Team, double> statsTimeSeconds = new Dictionary<Team, double> { { Team.Home, 0.0 }, { Team.Away, 0.0 } };
+        private int[] goalsPerQuarterHome = new int[5]; // Q1-Q4
+        private int[] goalsPerQuarterAway = new int[5];
+        private DateTime turnStartTime;
+        private Rectangle btnContinueStats;
+
+        private Player selectedPlayer = null;
+        private Player statsSelectedPlayer = null;
+        private List<Point> highlightedMoves = new List<Point>();
+
+        private int quarter = 1;
+        private int possessionCount = 1;
+        private int shotClock = 10;
+        private string message = "Welcome! Select Mode.";
+        private string bigMessage = "";
+
+        // Logging
+        private List<string> gameLog = new List<string>();
+        private const int MAX_LOG_LINES = 8;
+
+        // Rule Book Navigation
+        private int currentRulePage = 1;
+        private const int MAX_RULE_PAGES = 4;
+        private Rectangle btnNextPage, btnPrevPage;
+
+        // Dice Animation
+        private bool isDiceRolling = false;
+        private int diceValue = 1;
+        private int diceTarget = 1;
+        private int diceFrame = 0;
+        private Action onDiceFinish;
+        private System.Windows.Forms.Timer diceTimer;
+
+        // Shootout Variables
+        private int shootoutRound = 0;
+        private bool homeGoesFirst = true;
+        private Rectangle btnHeads, btnTails, btnFirst, btnSecond;
+        private bool coinFlipWinnerHome = false;
+
+        private System.Windows.Forms.Timer messageTimer;
+        private PointF animPos, animStart, animEnd;
+        private float animProgress = 0f;
+        private System.Windows.Forms.Timer animTimer;
+        private Action onAnimComplete;
+        private bool isAnimatingBall = false;
+        private Player animatingPlayer = null;
+        private System.Windows.Forms.Timer aiTimer;
+        private Dictionary<AnimalType, Image> animalImages = new Dictionary<AnimalType, Image>();
+        private Dictionary<Team, int> score = new Dictionary<Team, int> { { Team.Home, 0 }, { Team.Away, 0 } };
+        private Random rnd = new Random();
+        private System.Windows.Forms.Timer gameLoop;
+        private int hoverButtonIndex = -1;
+        private Rectangle[] menuButtons;
+
+        // --- 3D VIEW SETTINGS ---
+        private const int HEX_SIZE = 42;
+        private const float VIEW_TILT = 0.6f;
+        private const int TILE_DEPTH = 10;
+
+        public Form1()
+        {
+            this.Text = "Water Polo Strategic Board Game - 3D Chess Edition";
+            this.Size = new Size(1300, 850);
+            this.DoubleBuffered = true;
+            this.BackColor = Color.FromArgb(20, 80, 120);
+
+            board = new Board();
+            SetupMenuButtons();
+
+            this.KeyDown += OnKeyDown;
+            this.KeyPress += OnKeyPress;
+            this.MouseClick += OnMouseClick;
+            this.MouseDoubleClick += OnMouseDoubleClick;
+            this.MouseMove += OnMouseMove;
+
+            gameLoop = new System.Windows.Forms.Timer { Interval = 16 };
+            gameLoop.Tick += (s, e) => this.Invalidate();
+            gameLoop.Start();
+
+            messageTimer = new System.Windows.Forms.Timer { Interval = 2500 };
+            messageTimer.Tick += (s, e) => { bigMessage = ""; messageTimer.Stop(); };
+
+            animTimer = new System.Windows.Forms.Timer { Interval = 16 };
+            animTimer.Tick += UpdateAnimation;
+
+            aiTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+            aiTimer.Tick += ExecuteAITurn;
+
+            diceTimer = new System.Windows.Forms.Timer { Interval = 80 };
+            diceTimer.Tick += UpdateDiceAnim;
+        }
+
+        private void AddLog(string text)
+        {
+            gameLog.Add(text);
+            if (gameLog.Count > MAX_LOG_LINES) gameLog.RemoveAt(0);
+        }
+
+        private void SetupMenuButtons()
+        {
+            int cx = 1300 / 2;
+            int startY = 300;
+            int h = 50; int w = 400; int gap = 60;
+            menuButtons = new Rectangle[8];
+            for (int i = 0; i < 7; i++)
+                menuButtons[i] = new Rectangle(cx - w / 2, startY + (i * gap), w, h);
+            // 7th button index (Settings) actually inserted before Exit for UI flow, adjusted in Click
+            menuButtons[7] = new Rectangle(cx - w / 2, startY + (7 * gap), w, h); // New button slot
+
+            // Shootout buttons
+            btnHeads = new Rectangle(cx - 110, 400, 100, 50);
+            btnTails = new Rectangle(cx + 10, 400, 100, 50);
+            btnFirst = new Rectangle(cx - 110, 500, 100, 50);
+            btnSecond = new Rectangle(cx + 10, 500, 100, 50);
+
+            // Rule buttons
+            btnPrevPage = new Rectangle(50, 750, 150, 40);
+            btnNextPage = new Rectangle(1100, 750, 150, 40);
+
+            // Settings Buttons
+            btnTeamSizeMinus = new Rectangle(cx - 100, 200, 50, 50);
+            btnTeamSizePlus = new Rectangle(cx + 50, 200, 50, 50);
+            btnShotModToggle = new Rectangle(cx - 100, 300, 200, 50);
+            btnBackSettings = new Rectangle(cx - 100, 600, 200, 50);
+
+            // Stats Buttons
+            btnContinueStats = new Rectangle(cx - 100, 700, 200, 50);
+        }
+
+        private void TrackTime()
+        {
+            // Calculate time spent since last action
+            if (currentPhase != Phase.MainMenu && currentPhase != Phase.Halftime && currentPhase != Phase.Statistics)
+            {
+                TimeSpan elapsed = DateTime.Now - turnStartTime;
+                statsTimeSeconds[turnTeam] += elapsed.TotalSeconds;
+                turnStartTime = DateTime.Now;
+            }
+        }
+
+        // --- INPUT ---
+
+        private void OnMouseMove(object sender, MouseEventArgs e)
+        {
+            if (currentPhase == Phase.MainMenu)
+            {
+                int oldIndex = hoverButtonIndex;
+                hoverButtonIndex = -1;
+                for (int i = 0; i < menuButtons.Length; i++)
+                {
+                    if (menuButtons[i].Contains(e.Location)) { hoverButtonIndex = i; break; }
+                }
+                if (oldIndex != hoverButtonIndex) this.Invalidate();
+            }
+        }
+
+        private void OnKeyPress(object sender, KeyPressEventArgs e)
+        {
+            if (currentPhase == Phase.Roster && statsSelectedPlayer != null)
+            {
+                if (char.IsLetterOrDigit(e.KeyChar) || e.KeyChar == ' ')
+                {
+                    if (statsSelectedPlayer.Name.Length < 12) statsSelectedPlayer.Name += e.KeyChar;
+                }
+                else if (e.KeyChar == (char)8 && statsSelectedPlayer.Name.Length > 0)
+                {
+                    statsSelectedPlayer.Name = statsSelectedPlayer.Name.Substring(0, statsSelectedPlayer.Name.Length - 1);
+                }
+            }
+        }
+
+        private void OnKeyDown(object sender, KeyEventArgs e)
+        {
+            if (currentPhase == Phase.Rules || currentPhase == Phase.Roster || currentPhase == Phase.Settings)
+            {
+                if (e.KeyCode == Keys.Escape) currentPhase = Phase.MainMenu;
+                return;
+            }
+            if (e.KeyCode == Keys.Escape) { ResetGame(); return; }
+            if (currentPhase == Phase.MainMenu || currentPhase == Phase.GameOver || isDiceRolling || currentPhase == Phase.Halftime || currentPhase == Phase.Statistics) return;
+            if (currentPhase == Phase.Animating) return;
+            if (IsAiTurn()) return;
+
+            if (e.KeyCode == Keys.Space && currentPhase != Phase.ShootoutAim) AdvancePhase();
+            if (e.KeyCode == Keys.S && IsOffensePhase()) StartShootingPhase();
+        }
+
+        private void OnMouseDoubleClick(object sender, MouseEventArgs e)
+        {
+            if (currentPhase == Phase.Animating || currentPhase == Phase.Sprint || IsAiTurn() || isDiceRolling) return;
+            Point hexPos = PixelToHex3D(e.X, e.Y);
+            Player clickedPlayer = board.GetPlayerAt(hexPos);
+
+            if (clickedPlayer != null && !clickedPlayer.HasMoved && IsOffensePhase() || IsDefensePhase())
+            {
+                bool canControl = (clickedPlayer.Team == turnTeam && IsOffensePhase()) || (clickedPlayer.Team != turnTeam && IsDefensePhase());
+                if (canControl)
+                {
+                    clickedPlayer.HasMoved = true;
+                    selectedPlayer = null;
+                    highlightedMoves.Clear();
+                    message = "Player held position.";
+                    AddLog($"{clickedPlayer.Name} holds position.");
+                    TrackTime();
+                    if (IsDefensePhase()) CheckSandwichSteal();
+                }
+            }
+        }
+
+        private void OnMouseClick(object sender, MouseEventArgs e)
+        {
+            if (isDiceRolling) return;
+
+            if (currentPhase == Phase.Settings)
+            {
+                if (btnTeamSizeMinus.Contains(e.Location) && settingTeamSize > 5) settingTeamSize--;
+                if (btnTeamSizePlus.Contains(e.Location) && settingTeamSize < 7) settingTeamSize++;
+                if (btnShotModToggle.Contains(e.Location))
+                {
+                    if (settingShotChanceMod == 1.0f) settingShotChanceMod = 1.2f;
+                    else if (settingShotChanceMod == 1.2f) settingShotChanceMod = 0.8f;
+                    else settingShotChanceMod = 1.0f;
+                }
+                if (btnBackSettings.Contains(e.Location)) currentPhase = Phase.MainMenu;
+                return;
+            }
+
+            if (currentPhase == Phase.Halftime || currentPhase == Phase.Statistics)
+            {
+                if (btnContinueStats.Contains(e.Location))
+                {
+                    if (currentPhase == Phase.Halftime)
+                    {
+                        currentPhase = Phase.Sprint;
+                        turnStartTime = DateTime.Now;
+                        board.SetupTeamsForSprint(settingTeamSize);
+                        message = "Quarter 3 Start! Sprint!";
+                    }
+                    else
+                    {
+                        ResetGame();
+                    }
+                }
+                return;
+            }
+
+            if (currentPhase == Phase.Rules)
+            {
+                if (btnNextPage.Contains(e.Location) && currentRulePage < MAX_RULE_PAGES) currentRulePage++;
+                else if (btnPrevPage.Contains(e.Location) && currentRulePage > 1) currentRulePage--;
+                return;
+            }
+
+            if (currentPhase == Phase.MainMenu)
+            {
+                if (hoverButtonIndex != -1)
+                {
+                    switch (hoverButtonIndex)
+                    {
+                        case 0: gameMode = GameMode.PvP; StartGame(); break;
+                        case 1: gameMode = GameMode.PvAI; aiDifficulty = Difficulty.Easy; StartGame(); break;
+                        case 2: gameMode = GameMode.PvAI; aiDifficulty = Difficulty.Medium; StartGame(); break;
+                        case 3: gameMode = GameMode.PvAI; aiDifficulty = Difficulty.Hard; StartGame(); break;
+                        case 4: currentPhase = Phase.Rules; currentRulePage = 1; break;
+                        case 5: currentPhase = Phase.Settings; break;
+                        case 6: currentPhase = Phase.Roster; break;
+                        case 7: Application.Exit(); break;
+                    }
+                }
+                return;
+            }
+
+            if (currentPhase == Phase.ShootoutCoinFlip)
+            {
+                if (btnHeads.Contains(e.Location)) ResolveCoinFlip(true);
+                else if (btnTails.Contains(e.Location)) ResolveCoinFlip(false);
+                else if (btnFirst.Contains(e.Location) && message.Contains("Choose")) StartShootoutRounds(true);
+                else if (btnSecond.Contains(e.Location) && message.Contains("Choose")) StartShootoutRounds(false);
+                return;
+            }
+
+            if (currentPhase == Phase.Roster)
+            {
+                Point hPos = PixelToHex3D(e.X, e.Y);
+                Player p = board.GetPlayerAt(hPos);
+                if (p != null) statsSelectedPlayer = p;
+                return;
+            }
+
+            if (currentPhase == Phase.Animating || IsAiTurn()) return;
+
+            if (currentPhase == Phase.Sprint) { RollSprint(); return; }
+
+            Point hexPos = PixelToHex3D(e.X, e.Y);
+
+            if (currentPhase == Phase.ShootoutAim)
+            {
+                List<Point> targetGoal = (turnTeam == Team.Home) ? board.AwayGoal : board.HomeGoal;
+                if (turnTeam != aiTeam && targetGoal.Contains(hexPos))
+                {
+                    int goalieGuessIndex = rnd.Next(0, 3);
+                    Point aiBlock = targetGoal[goalieGuessIndex];
+                    ResolveShootoutShot(hexPos, aiBlock);
+                }
+                else if (turnTeam == aiTeam && targetGoal.Contains(hexPos))
+                {
+                    int aiShotIndex = rnd.Next(0, 3);
+                    Point aiShot = targetGoal[aiShotIndex];
+                    ResolveShootoutShot(aiShot, hexPos);
+                }
+                return;
+            }
+
+            Player clickedPlayer = board.GetPlayerAt(hexPos);
+
+            if (currentPhase == Phase.ShootingSelection)
+            {
+                List<Point> targetGoal = (turnTeam == Team.Home) ? board.AwayGoal : board.HomeGoal;
+                if (targetGoal.Contains(hexPos)) ResolveShot(hexPos);
+                else { currentPhase = Phase.HalfCourtOffense; message = "Shot Cancelled."; highlightedMoves.Clear(); }
+                return;
+            }
+
+            if (selectedPlayer != null && highlightedMoves.Contains(hexPos) && clickedPlayer == null)
+            {
+                TrackTime();
+                StartPlayerAnimation(selectedPlayer, hexPos, () =>
+                {
+                    if (IsDefensePhase()) CheckSandwichSteal();
+                });
+                highlightedMoves.Clear();
+                selectedPlayer = null;
+                return;
+            }
+
+            if (clickedPlayer != null && selectedPlayer != null && selectedPlayer == board.BallOwner && clickedPlayer.Team == selectedPlayer.Team && clickedPlayer != selectedPlayer)
+            {
+                AttemptPass(selectedPlayer, clickedPlayer);
+                selectedPlayer = null;
+                highlightedMoves.Clear();
+                return;
+            }
+
+            if (clickedPlayer != null)
+            {
+                bool canSelect = false;
+                if (IsOffensePhase() && clickedPlayer.Team == turnTeam) canSelect = true;
+                else if (IsDefensePhase() && clickedPlayer.Team != turnTeam) canSelect = true;
+
+                if (canSelect && !clickedPlayer.HasMoved)
+                {
+                    selectedPlayer = clickedPlayer;
+                    CalculateValidMoves();
+                }
+            }
+            else
+            {
+                selectedPlayer = null;
+                highlightedMoves.Clear();
+            }
+        }
+
+        // --- DICE LOGIC ---
+
+        private void RollDice(int maxVal, Action<int> onFinishResult)
+        {
+            isDiceRolling = true;
+            diceTarget = rnd.Next(1, maxVal + 1);
+            diceFrame = 0;
+            onDiceFinish = () => {
+                isDiceRolling = false;
+                onFinishResult(diceTarget);
+            };
+            diceTimer.Start();
+        }
+
+        private void UpdateDiceAnim(object sender, EventArgs e)
+        {
+            diceFrame++;
+            diceValue = rnd.Next(1, 7); // Randomize while rolling
+            if (diceFrame > 10)
+            {
+                diceTimer.Stop();
+                diceValue = diceTarget;
+                onDiceFinish?.Invoke();
+            }
+        }
+
+        // --- AI LOGIC ---
+
+        private bool IsAiTurn()
+        {
+            if (gameMode == GameMode.PvP || currentPhase == Phase.MainMenu || currentPhase == Phase.GameOver) return false;
+            if (currentPhase == Phase.Sprint || currentPhase == Phase.ShootoutCoinFlip) return false;
+            if (currentPhase == Phase.ShootoutAim || currentPhase == Phase.Halftime || currentPhase == Phase.Statistics || currentPhase == Phase.Settings) return false;
+
+            if (turnTeam == aiTeam && IsOffensePhase()) return true;
+            if (turnTeam != aiTeam && IsDefensePhase()) return true;
+            return false;
+        }
+
+        private void ExecuteAITurn(object sender, EventArgs e)
+        {
+            aiTimer.Stop();
+            if (!IsAiTurn()) return;
+
+            TrackTime();
+            message = $"AI ({aiDifficulty}) Thinking...";
+
+            if (currentPhase.ToString().Contains("CAP"))
+            {
+                List<Player> aiPlayers = board.Players.Where(p => p.Team == aiTeam && !p.HasMoved && !p.IsGoalie).ToList();
+                foreach (var p in aiPlayers)
+                {
+                    Point bestMove = GetBestMove(p, 4);
+                    p.Q = bestMove.X; p.R = bestMove.Y;
+                    p.HasMoved = true;
+                }
+                if (IsDefensePhase()) CheckSandwichSteal();
+                AdvancePhase();
+                return;
+            }
+
+            if (currentPhase == Phase.HalfCourtOffense || currentPhase == Phase.HalfCourtDefense)
+            {
+                bool didAction = false;
+                if (IsOffensePhase())
+                {
+                    Player ballCarrier = board.BallOwner;
+                    if (ballCarrier != null && ballCarrier.Team == aiTeam)
+                    {
+                        Point targetGoal = board.HomeGoal[1];
+                        double currentShotChance = CalculateShotChance(ballCarrier.Hex, targetGoal);
+                        int dist = Board.GetHexDist(ballCarrier.Hex, targetGoal);
+                        bool shouldShoot = false;
+                        if (shotClock <= 3) shouldShoot = true;
+                        else if (dist <= 4 && aiDifficulty != Difficulty.Easy) shouldShoot = true;
+                        else
+                        {
+                            if (aiDifficulty == Difficulty.Easy && currentShotChance > 0.16) shouldShoot = (rnd.Next(0, 2) == 0);
+                            else if (aiDifficulty == Difficulty.Medium && currentShotChance > 0.3) shouldShoot = true;
+                            else if (aiDifficulty == Difficulty.Hard && currentShotChance > 0.5) shouldShoot = true;
+                        }
+
+                        if (shouldShoot) { ResolveShot(targetGoal); didAction = true; }
+                        else
+                        {
+                            var teammates = board.Players.Where(p => p.Team == aiTeam && p != ballCarrier).ToList();
+                            Player bestReceiver = null;
+                            double bestScore = -999;
+                            foreach (var t in teammates)
+                            {
+                                double distGoal = Board.GetHexDist(t.Hex, targetGoal);
+                                double chanceIfPass = CalculateShotChance(t.Hex, targetGoal);
+                                double score = (chanceIfPass * 100) - (distGoal * 5);
+                                if (score > bestScore) { bestScore = score; bestReceiver = t; }
+                            }
+                            if (bestReceiver != null && (Board.GetHexDist(bestReceiver.Hex, targetGoal) < dist || rnd.Next(0, 3) == 0))
+                            {
+                                AttemptPass(ballCarrier, bestReceiver, () => { AdvancePhase(); });
+                                didAction = true;
+                            }
+                            else
+                            {
+                                Point bestMove = GetBestMove(ballCarrier, 1);
+                                StartPlayerAnimation(ballCarrier, bestMove, () => { AdvancePhase(); });
+                                return;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    Player threat = board.BallOwner;
+                    Player bestDefender = board.Players.Where(p => p.Team == aiTeam && !p.HasMoved && !p.IsGoalie)
+                        .OrderBy(p => Board.GetHexDist(p.Hex, threat.Hex)).FirstOrDefault();
+
+                    if (bestDefender != null)
+                    {
+                        Point bestMove = GetBestMove(bestDefender, 1);
+                        StartPlayerAnimation(bestDefender, bestMove, () => { CheckSandwichSteal(); AdvancePhase(); });
+                        return;
+                    }
+                }
+                if (!didAction) AdvancePhase();
+            }
+        }
+
+        private Point GetBestMove(Player p, int range)
+        {
+            List<Point> validMoves = new List<Point>();
+            foreach (var kvp in board.Hexes)
+            {
+                bool isValidType = (kvp.Value == HexType.Field || kvp.Value.ToString().Contains("Crease") || kvp.Value.ToString().Contains("Goal"));
+                if (isValidType && Board.GetHexDist(p.Hex, kvp.Key) <= range && board.GetPlayerAt(kvp.Key) == null)
+                    validMoves.Add(kvp.Key);
+            }
+            if (validMoves.Count == 0) return p.Hex;
+            Point target = (p.Team == aiTeam) ? board.HomeGoal[1] : board.AwayGoal[1];
+            if (!IsOffensePhase() && board.BallOwner != null) target = board.BallOwner.Hex;
+            if (aiDifficulty == Difficulty.Easy) return validMoves[rnd.Next(validMoves.Count)];
+            return validMoves.OrderBy(m => Board.GetHexDist(m, target)).First();
+        }
+
+        // --- ANIMATION ---
+
+        private void StartPlayerAnimation(Player p, Point destHex, Action onComplete)
+        {
+            animatingPlayer = p;
+            isAnimatingBall = false;
+            StartAnimGeneric(p.Hex, destHex, () =>
+            {
+                p.Q = destHex.X;
+                p.R = destHex.Y;
+                p.HasMoved = true;
+                animatingPlayer = null;
+                onComplete?.Invoke();
+            });
+        }
+
+        private void StartBallAnimation(Point startHex, Point endHex, Action onComplete)
+        {
+            isAnimatingBall = true;
+            StartAnimGeneric(startHex, endHex, onComplete);
+        }
+
+        private void StartAnimGeneric(Point startHex, Point endHex, Action onComplete)
+        {
+            animStart = HexToPixel3D(startHex);
+            animEnd = HexToPixel3D(endHex);
+            animPos = animStart;
+            animProgress = 0f;
+            nextPhaseAfterAnim = currentPhase;
+            currentPhase = Phase.Animating;
+            this.onAnimComplete = onComplete;
+            animTimer.Start();
+        }
+
+        private void UpdateAnimation(object sender, EventArgs e)
+        {
+            animProgress += 0.08f;
+            if (animProgress >= 1f)
+            {
+                animProgress = 1f;
+                animTimer.Stop();
+                currentPhase = nextPhaseAfterAnim;
+                onAnimComplete?.Invoke();
+            }
+            float x = animStart.X + (animEnd.X - animStart.X) * animProgress;
+            float y = animStart.Y + (animEnd.Y - animStart.Y) * animProgress;
+            animPos = new PointF(x, y);
+        }
+
+        // --- GAME MECHANICS ---
+
+        private void StartGame()
+        {
+            currentPhase = Phase.Sprint;
+            turnStartTime = DateTime.Now;
+            board.SetupTeamsForSprint(settingTeamSize);
+            message = "Game Started! Press SPACE for Sprint.";
+        }
+
+        private void CheckSandwichSteal()
+        {
+            Player ballHolder = board.BallOwner;
+            if (ballHolder == null) return;
+            Point[] offsets = { new Point(1, 0), new Point(0, 1), new Point(-1, 1), new Point(-1, 0), new Point(0, -1), new Point(1, -1) };
+            for (int i = 0; i < 3; i++)
+            {
+                Point p1 = new Point(ballHolder.Q + offsets[i].X, ballHolder.R + offsets[i].Y);
+                Point p2 = new Point(ballHolder.Q + offsets[i + 3].X, ballHolder.R + offsets[i + 3].Y);
+                Player def1 = board.GetPlayerAt(p1);
+                Player def2 = board.GetPlayerAt(p2);
+
+                if (def1 != null && def1.Team != ballHolder.Team && def2 != null && def2.Team != ballHolder.Team)
+                {
+                    def1.StatsSteals++;
+                    Turnover($"Sandwich Steal by {def1.Name}!", def1);
+                    return;
+                }
+            }
+        }
+
+        private void Turnover(string reason, Player recipient = null)
+        {
+            Team nextTeam = (turnTeam == Team.Home) ? Team.Away : Team.Home;
+            possessionCount++;
+            TrackTime();
+            CheckQuarterEnd();
+            if (currentPhase != Phase.ShootoutCoinFlip && currentPhase != Phase.GameOver && currentPhase != Phase.Halftime && currentPhase != Phase.Statistics)
+            {
+                SetupPossession(nextTeam, Phase.CAP1_Offense);
+                message = reason;
+                if (recipient != null) board.BallOwner = recipient;
+                else
+                {
+                    var goalie = board.Players.FirstOrDefault(p => p.Team == nextTeam && p.IsGoalie);
+                    if (goalie != null) board.BallOwner = goalie;
+                }
+            }
+        }
+
+        private bool IsOffensePhase()
+        {
+            return currentPhase == Phase.CAP1_Offense || currentPhase == Phase.CAP2_Offense || currentPhase == Phase.HalfCourtOffense;
+        }
+
+        private bool IsDefensePhase()
+        {
+            return currentPhase == Phase.CAP1_Defense || currentPhase == Phase.CAP2_Defense || currentPhase == Phase.HalfCourtDefense;
+        }
+
+        private void CalculateValidMoves()
+        {
+            highlightedMoves.Clear();
+            if (selectedPlayer == null || selectedPlayer.HasMoved) return;
+            int moveRange = currentPhase.ToString().Contains("CAP") ? 4 : 1;
+            foreach (var kvp in board.Hexes)
+            {
+                bool isValidType = (kvp.Value == HexType.Field || kvp.Value.ToString().Contains("Crease") || kvp.Value.ToString().Contains("Goal"));
+                if (isValidType && Board.GetHexDist(selectedPlayer.Hex, kvp.Key) <= moveRange && board.GetPlayerAt(kvp.Key) == null)
+                    highlightedMoves.Add(kvp.Key);
+            }
+        }
+
+        private void RollSprint()
+        {
+            RollDice(6, (result) => {
+                Team winner = (result <= 3) ? Team.Away : Team.Home;
+                AddLog($"Sprint Roll: {result}. Winner: {winner}");
+                SetupPossession(winner, Phase.CAP1_Offense);
+                message = $"{winner} Wins Sprint!";
+            });
+        }
+
+        private void AdvancePhase()
+        {
+            TrackTime();
+            if (currentPhase == Phase.Sprint) { RollSprint(); return; }
+            else if (currentPhase == Phase.CAP1_Offense) { currentPhase = Phase.CAP1_Defense; message = "CAP 1: Defense move."; ResetMoves(); }
+            else if (currentPhase == Phase.CAP1_Defense) { currentPhase = Phase.CAP2_Offense; message = "CAP 2: Offense move."; ResetMoves(); }
+            else if (currentPhase == Phase.CAP2_Offense) { currentPhase = Phase.CAP2_Defense; message = "CAP 2: Defense move."; ResetMoves(); }
+            else if (currentPhase == Phase.CAP2_Defense) { currentPhase = Phase.HalfCourtOffense; shotClock = 10; message = $"Half Court: Offense."; ResetMoves(); }
+            else if (currentPhase == Phase.HalfCourtOffense) { currentPhase = Phase.HalfCourtDefense; message = "Half Court: Defense."; ResetMoves(); }
+            else if (currentPhase == Phase.HalfCourtDefense)
+            {
+                shotClock--;
+                if (shotClock <= 0) Turnover("Shot Clock Expired!");
+                else { currentPhase = Phase.HalfCourtOffense; message = $"Shot Clock: {shotClock}. Offense Turn."; ResetMoves(); }
+            }
+
+            if (IsAiTurn()) aiTimer.Start();
+        }
+
+        private void SetupPossession(Team team, Phase startPhase)
+        {
+            turnTeam = team;
+            currentPhase = startPhase;
+            var fieldPlayers = board.Players.Where(p => p.Team == team && !p.IsGoalie).ToList();
+            if (fieldPlayers.Any()) board.BallOwner = fieldPlayers[0];
+            ResetMoves();
+            if (IsAiTurn()) aiTimer.Start();
+        }
+
+        private void CheckQuarterEnd()
+        {
+            if (possessionCount > 9) // Standard 5 Possessions per team approx
+            {
+                quarter++;
+                possessionCount = 1;
+
+                if (quarter == 3)
+                {
+                    message = "HALFTIME";
+                    currentPhase = Phase.Halftime;
+                }
+                else if (quarter > 4)
+                {
+                    if (score[Team.Home] == score[Team.Away])
+                    {
+                        message = "QUARTERS DONE. TIE GAME -> SHOOTOUT!";
+                        currentPhase = Phase.ShootoutCoinFlip;
+                    }
+                    else
+                    {
+                        currentPhase = Phase.Statistics; // Go to Stats instead of straight Game Over
+                        ShowBigMessage("GAME OVER");
+                    }
+                }
+                else
+                {
+                    message = $"End of Quarter {quarter - 1}!";
+                    currentPhase = Phase.Sprint;
+                    board.SetupTeamsForSprint(settingTeamSize);
+                }
+            }
+        }
+
+        // --- SHOOTOUT LOGIC ---
+
+        private void ResolveCoinFlip(bool pickedHeads)
+        {
+            RollDice(2, (result) => {
+                bool isHeads = (result == 1);
+                bool userWon = (pickedHeads == isHeads);
+                coinFlipWinnerHome = userWon;
+                message = $"Coin: {(isHeads ? "HEADS" : "TAILS")}. {(userWon ? "Home" : "Away")} Won! Choose Order.";
+                AddLog($"Coin Flip: {(isHeads ? "Heads" : "Tails")}.");
+            });
+        }
+
+        private void StartShootoutRounds(bool homeFirst)
+        {
+            homeGoesFirst = homeFirst;
+            shootoutRound = 1;
+            SetupShootoutTurn();
+        }
+
+        private void SetupShootoutTurn()
+        {
+            if (shootoutRound == 1 && currentPhase != Phase.ShootoutAim)
+                turnTeam = homeGoesFirst ? Team.Home : Team.Away;
+            else
+                turnTeam = (turnTeam == Team.Home) ? Team.Away : Team.Home;
+
+            if (shootoutRound > 5 && score[Team.Home] != score[Team.Away])
+            {
+                currentPhase = Phase.Statistics;
+                ShowBigMessage("GAME OVER");
+                return;
+            }
+
+            board.SetupShootout(turnTeam);
+            currentPhase = Phase.ShootoutAim;
+
+            if (turnTeam == aiTeam) message = $"Shootout Round {shootoutRound}. AI Shooting. CLICK GOAL TO BLOCK!";
+            else message = $"Shootout Round {shootoutRound}. Your Shot. CLICK GOAL TO SHOOT!";
+
+            highlightedMoves.Clear();
+            List<Point> targetGoal = (turnTeam == Team.Home) ? board.AwayGoal : board.HomeGoal;
+            highlightedMoves.AddRange(targetGoal);
+        }
+
+        private void ResolveShootoutShot(Point targetHex, Point blockHex)
+        {
+            StartBallAnimation(board.BallOwner.Hex, targetHex, () =>
+            {
+                Player goalie = board.Players.First(p => p.IsGoalie);
+                goalie.Q = blockHex.X; goalie.R = blockHex.Y;
+
+                AddLog($"Shot: {targetHex}. Block Attempt: {blockHex}");
+
+                if (targetHex == blockHex)
+                {
+                    ShowBigMessage("BLOCKED!");
+                    AddLog("Shot Blocked!");
+                }
+                else
+                {
+                    ShowBigMessage("GOAL!");
+                    score[turnTeam]++;
+                    AddLog("Shootout Goal!");
+                }
+
+                if (!homeGoesFirst && turnTeam == Team.Home) shootoutRound++;
+                else if (homeGoesFirst && turnTeam == Team.Away) shootoutRound++;
+
+                if (shootoutRound == 6 && score[Team.Home] != score[Team.Away])
+                {
+                    currentPhase = Phase.Statistics;
+                    ShowBigMessage("GAME OVER");
+                }
+                else
+                {
+                    System.Windows.Forms.Timer t = new System.Windows.Forms.Timer { Interval = 1000 };
+                    t.Tick += (s, e) => { t.Stop(); SetupShootoutTurn(); };
+                    t.Start();
+                }
+            });
+        }
+
+        // --- PASSING ---
+
+        private void AttemptPass(Player sender, Player receiver, Action onPassComplete = null)
+        {
+            TrackTime();
+            StartBallAnimation(sender.Hex, receiver.Hex, () => ResolvePass(sender, receiver, onPassComplete));
+        }
+
+        private void ResolvePass(Player sender, Player receiver, Action onPassComplete)
+        {
+            // Stats
+            statsPasses[sender.Team]++;
+
+            List<Point> path = GetLineOfSight(sender.Hex, receiver.Hex);
+            foreach (Point p in path)
+            {
+                if (p == sender.Hex || p == receiver.Hex) continue;
+                Player interceptor = board.GetPlayerAt(p);
+                if (interceptor != null && interceptor.Team != sender.Team)
+                {
+                    if (Board.GetHexDist(interceptor.Hex, sender.Hex) == 1 || Board.GetHexDist(interceptor.Hex, receiver.Hex) == 1)
+                    {
+                        interceptor.StatsSteals++;
+                        Turnover($"Intercepted by {interceptor.Name}!", interceptor);
+                        return;
+                    }
+                }
+            }
+
+            var adjDefender = board.Players.FirstOrDefault(p => p.Team != sender.Team && Board.GetHexDist(p.Hex, sender.Hex) == 1);
+            if (adjDefender != null)
+            {
+                Point goalLoc = (sender.Team == Team.Home) ? board.AwayGoal[1] : board.HomeGoal[1];
+                int distAtt = Board.GetHexDist(sender.Hex, goalLoc);
+                int distDef = Board.GetHexDist(adjDefender.Hex, goalLoc);
+                bool onCrease = board.Hexes[sender.Hex].ToString().Contains("Crease");
+
+                PressureType type = PressureType.SideBySide;
+                if (onCrease) type = PressureType.Crease;
+                else if (distAtt < distDef) type = PressureType.InsideWater;
+                else if (distDef < distAtt) type = PressureType.Perimeter;
+
+                RollDice(6, (roll) =>
+                {
+                    bool success = true;
+                    string failMsg = "";
+                    switch (type)
+                    {
+                        case PressureType.Perimeter:
+                            if (roll <= 2) { success = false; failMsg = "Steal (Perimeter)"; }
+                            break;
+                        case PressureType.InsideWater:
+                            if (roll == 1) { success = false; failMsg = "Steal (Inside)"; }
+                            break;
+                        case PressureType.Crease:
+                            if (roll <= 2) { success = false; failMsg = "Steal (Crease)"; }
+                            break;
+                        case PressureType.SideBySide:
+                            if (roll == 1) { success = false; failMsg = "Steal (Drive)"; }
+                            break;
+                    }
+                    AddLog($"Pass under {type}. Roll: {roll}. Success: {success}");
+
+                    if (!success)
+                    {
+                        adjDefender.StatsSteals++;
+                        Turnover(failMsg, adjDefender);
+                    }
+                    else
+                    {
+                        board.BallOwner = receiver;
+                        onPassComplete?.Invoke();
+                    }
+                });
+            }
+            else
+            {
+                board.BallOwner = receiver;
+                onPassComplete?.Invoke();
+            }
+        }
+
+        private void StartShootingPhase()
+        {
+            if (board.BallOwner == null || board.BallOwner.Team != turnTeam) return;
+            currentPhase = Phase.ShootingSelection;
+            message = "Select a Goal Hexagon to shoot at!";
+            highlightedMoves.Clear();
+            List<Point> targetGoal = (turnTeam == Team.Home) ? board.AwayGoal : board.HomeGoal;
+            highlightedMoves.AddRange(targetGoal);
+        }
+
+        private double CalculateShotChance(Point shooterHex, Point targetHex)
+        {
+            Team defendingTeam = (turnTeam == Team.Home) ? Team.Away : Team.Home;
+            var goalie = board.Players.FirstOrDefault(p => p.Team == defendingTeam && p.IsGoalie);
+
+            bool goalieInNet = false;
+            if (goalie != null)
+            {
+                HexType gHexType = board.Hexes.ContainsKey(goalie.Hex) ? board.Hexes[goalie.Hex] : HexType.Field;
+                if (gHexType == HexType.GoalHome || gHexType == HexType.GoalAway) goalieInNet = true;
+            }
+
+            if (!goalieInNet) return 0.833 * settingShotChanceMod;
+
+            int dist = Board.GetHexDist(shooterHex, targetHex);
+            double pct = 0.16;
+            if (dist <= 2) pct = 0.83;
+            else if (dist <= 4) pct = 0.50;
+            else if (dist <= 6) pct = 0.33;
+            else pct = 0.166;
+
+            List<Point> lineOfSight = GetLineOfSight(shooterHex, targetHex);
+            int defendersInWay = 0;
+            foreach (Point p in lineOfSight)
+            {
+                if (p == shooterHex) continue;
+                Player blocker = board.GetPlayerAt(p);
+                if (blocker != null && blocker.Team != turnTeam) defendersInWay++;
+            }
+            if (defendersInWay > 0) pct -= (defendersInWay * 0.166);
+            if (pct < 0.05) pct = 0.05;
+
+            // Apply Setting Modifier
+            pct *= settingShotChanceMod;
+            if (pct > 0.95) pct = 0.95;
+
+            return pct;
+        }
+
+        private void ResolveShot(Point targetHex)
+        {
+            TrackTime();
+            Point shooterHex = board.BallOwner.Hex;
+            Player shooter = board.BallOwner;
+            double pct = CalculateShotChance(shooterHex, targetHex);
+            statsShotsTaken[turnTeam]++;
+
+            StartBallAnimation(shooterHex, targetHex, () =>
+            {
+                RollDice(100, (roll) =>
+                {
+                    int successThreshold = (int)(pct * 100);
+                    AddLog($"Shot Chance: {pct:P0}. Roll: {roll}.");
+
+                    if (roll <= successThreshold)
+                    {
+                        score[turnTeam]++;
+                        if (turnTeam == Team.Home) goalsPerQuarterHome[quarter - 1]++;
+                        else goalsPerQuarterAway[quarter - 1]++;
+
+                        shooter.StatsGoals++;
+                        ShowBigMessage("GOAL!");
+                        Team nextTeam = (turnTeam == Team.Home) ? Team.Away : Team.Home;
+                        board.SetupAfterGoalLineup(settingTeamSize);
+                        SetupPossession(nextTeam, Phase.CAP2_Offense);
+                        possessionCount++;
+                        CheckQuarterEnd();
+                    }
+                    else
+                    {
+                        Player blocker = board.GetPlayerAt(targetHex);
+                        if (blocker != null && blocker.Team != turnTeam) blocker.StatsBlocks++;
+                        ShowBigMessage("BLOCK!");
+                        Turnover("Shot Blocked / Missed.");
+                    }
+                });
+            });
+        }
+
+        private List<Point> GetLineOfSight(Point start, Point end)
+        {
+            List<Point> results = new List<Point>();
+            int N = Board.GetHexDist(start, end);
+            for (int i = 0; i <= N; i++)
+            {
+                float t = (float)i / N;
+                float q = start.X + (end.X - start.X) * t;
+                float r = start.Y + (end.Y - start.Y) * t;
+                results.Add(HexRound(q, r));
+            }
+            return results;
+        }
+
+        private void ShowBigMessage(string msg) { bigMessage = msg; messageTimer.Start(); }
+        private void ResetMoves() { highlightedMoves.Clear(); foreach (var p in board.Players) p.HasMoved = false; }
+        private void ResetGame()
+        {
+            score[Team.Home] = 0; score[Team.Away] = 0;
+            statsPasses[Team.Home] = 0; statsPasses[Team.Away] = 0;
+            statsShotsTaken[Team.Home] = 0; statsShotsTaken[Team.Away] = 0;
+            statsTimeSeconds[Team.Home] = 0; statsTimeSeconds[Team.Away] = 0;
+            goalsPerQuarterHome = new int[5]; goalsPerQuarterAway = new int[5];
+
+            quarter = 1; possessionCount = 1;
+            board = new Board();
+            currentPhase = Phase.MainMenu;
+            message = "Select Mode";
+        }
+
+        // --- DRAWING ---
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+
+            if (currentPhase == Phase.MainMenu)
+            {
+                using (LinearGradientBrush brush = new LinearGradientBrush(this.ClientRectangle, Color.FromArgb(0, 20, 50), Color.FromArgb(0, 100, 200), LinearGradientMode.Vertical))
+                    e.Graphics.FillRectangle(brush, this.ClientRectangle);
+
+                using (Font title = new Font("Arial", 48, FontStyle.Bold))
+                using (Font shadow = new Font("Arial", 48, FontStyle.Bold))
+                {
+                    string titleText = "WATER POLO STRATEGY";
+                    SizeF sz = e.Graphics.MeasureString(titleText, title);
+                    e.Graphics.DrawString(titleText, shadow, Brushes.Black, (Width - sz.Width) / 2 + 4, 84);
+                    e.Graphics.DrawString(titleText, title, Brushes.White, (Width - sz.Width) / 2, 80);
+                }
+
+                string[] labels = { "2-Player (PvP)", "1-Player (Easy AI)", "1-Player (Medium AI)", "1-Player (Hard AI)", "Rules", "Settings", "Team Roster & Stats", "Exit Game" };
+                using (Font btnFont = new Font("Arial", 16, FontStyle.Bold))
+                {
+                    for (int i = 0; i < menuButtons.Length; i++)
+                    {
+                        Rectangle r = menuButtons[i];
+                        bool hover = (i == hoverButtonIndex);
+                        Color btnColor = hover ? Color.FromArgb(200, 255, 255, 255) : Color.FromArgb(100, 255, 255, 255);
+                        using (SolidBrush b = new SolidBrush(btnColor)) e.Graphics.FillRectangle(b, r);
+                        e.Graphics.DrawRectangle(Pens.White, r);
+                        SizeF sz = e.Graphics.MeasureString(labels[i], btnFont);
+                        e.Graphics.DrawString(labels[i], btnFont, hover ? Brushes.Black : Brushes.White, r.X + (r.Width - sz.Width) / 2, r.Y + (r.Height - sz.Height) / 2);
+                    }
+                }
+                return;
+            }
+
+            if (currentPhase == Phase.Settings)
+            {
+                e.Graphics.Clear(Color.DarkSlateGray);
+                e.Graphics.DrawString("SETTINGS", new Font("Arial", 36, FontStyle.Bold), Brushes.White, 500, 50);
+
+                // Team Size
+                e.Graphics.DrawString($"TEAM SIZE: {settingTeamSize} Players", new Font("Arial", 18), Brushes.White, 400, 210);
+                e.Graphics.FillRectangle(Brushes.Gray, btnTeamSizeMinus);
+                e.Graphics.DrawString("-", new Font("Arial", 24), Brushes.White, btnTeamSizeMinus.X + 15, btnTeamSizeMinus.Y + 5);
+                e.Graphics.FillRectangle(Brushes.Gray, btnTeamSizePlus);
+                e.Graphics.DrawString("+", new Font("Arial", 24), Brushes.White, btnTeamSizePlus.X + 15, btnTeamSizePlus.Y + 5);
+
+                // Shot Mod
+                string luck = "Normal";
+                if (settingShotChanceMod > 1.0) luck = "High (Easy Goals)";
+                if (settingShotChanceMod < 1.0) luck = "Low (Hard Goals)";
+                e.Graphics.DrawString($"SHOT LUCK: {luck}", new Font("Arial", 18), Brushes.White, 400, 310);
+                e.Graphics.FillRectangle(Brushes.Gray, btnShotModToggle);
+                e.Graphics.DrawString("Toggle", new Font("Arial", 14), Brushes.White, btnShotModToggle.X + 60, btnShotModToggle.Y + 15);
+
+                // Back
+                e.Graphics.FillRectangle(Brushes.Red, btnBackSettings);
+                e.Graphics.DrawString("BACK", new Font("Arial", 14), Brushes.White, btnBackSettings.X + 70, btnBackSettings.Y + 15);
+                return;
+            }
+
+            if (currentPhase == Phase.Halftime || currentPhase == Phase.Statistics)
+            {
+                e.Graphics.Clear(Color.Black);
+                string title = (currentPhase == Phase.Halftime) ? "HALFTIME REPORT" : "FINAL STATISTICS";
+                e.Graphics.DrawString(title, new Font("Arial", 32, FontStyle.Bold), Brushes.Gold, 450, 50);
+
+                // Calculate MVP
+                Player mvp = board.Players.OrderByDescending(p => p.StatsGoals).FirstOrDefault();
+                string mvpText = (mvp != null) ? $"{mvp.Name} ({mvp.Team}) - {mvp.StatsGoals} Goals" : "None";
+                e.Graphics.DrawString($"MVP: {mvpText}", new Font("Arial", 20), Brushes.White, 50, 150);
+
+                // Table Header
+                int startY = 250;
+                int col1 = 300, col2 = 600, col3 = 900;
+                Font hFont = new Font("Arial", 16, FontStyle.Bold);
+                Font rFont = new Font("Arial", 14);
+
+                e.Graphics.DrawString("METRIC", hFont, Brushes.Gray, col1, startY);
+                e.Graphics.DrawString("HOME", hFont, Brushes.Red, col2, startY);
+                e.Graphics.DrawString("AWAY", hFont, Brushes.Cyan, col3, startY);
+
+                // Data Rows
+                string[] metrics = { "Total Goals", "Passes Completed", "Shots Taken", "Shot %", "Decision Time (s)", "Q1 Goals", "Q2 Goals", "Q3 Goals", "Q4 Goals" };
+
+                int homeGoals = score[Team.Home];
+                int awayGoals = score[Team.Away];
+                double homeShotPct = (statsShotsTaken[Team.Home] > 0) ? (double)homeGoals / statsShotsTaken[Team.Home] : 0;
+                double awayShotPct = (statsShotsTaken[Team.Away] > 0) ? (double)awayGoals / statsShotsTaken[Team.Away] : 0;
+
+                string[] homeVals = {
+                    homeGoals.ToString(), statsPasses[Team.Home].ToString(), statsShotsTaken[Team.Home].ToString(),
+                    homeShotPct.ToString("P0"), statsTimeSeconds[Team.Home].ToString("F0"),
+                    goalsPerQuarterHome[0].ToString(), goalsPerQuarterHome[1].ToString(), goalsPerQuarterHome[2].ToString(), goalsPerQuarterHome[3].ToString()
+                };
+                string[] awayVals = {
+                    awayGoals.ToString(), statsPasses[Team.Away].ToString(), statsShotsTaken[Team.Away].ToString(),
+                    awayShotPct.ToString("P0"), statsTimeSeconds[Team.Away].ToString("F0"),
+                    goalsPerQuarterAway[0].ToString(), goalsPerQuarterAway[1].ToString(), goalsPerQuarterAway[2].ToString(), goalsPerQuarterAway[3].ToString()
+                };
+
+                for (int i = 0; i < metrics.Length; i++)
+                {
+                    int y = startY + 40 + (i * 30);
+                    e.Graphics.DrawString(metrics[i], rFont, Brushes.White, col1, y);
+                    e.Graphics.DrawString(homeVals[i], rFont, Brushes.White, col2, y);
+                    e.Graphics.DrawString(awayVals[i], rFont, Brushes.White, col3, y);
+                }
+
+                e.Graphics.FillRectangle(Brushes.Green, btnContinueStats);
+                string btnText = (currentPhase == Phase.Halftime) ? "START Q3" : "MAIN MENU";
+                e.Graphics.DrawString(btnText, new Font("Arial", 14, FontStyle.Bold), Brushes.Black, btnContinueStats.X + 40, btnContinueStats.Y + 15);
+                return;
+            }
+
+            if (currentPhase == Phase.Rules)
+            {
+                e.Graphics.Clear(Color.Navy);
+                e.Graphics.DrawString($"RULES (Page {currentRulePage}/{MAX_RULE_PAGES})", new Font("Arial", 24, FontStyle.Bold), Brushes.White, 50, 30);
+
+                string ruleText = "";
+
+                if (currentRulePage == 1)
+                {
+                    ruleText =
+                        "OVERVIEW & CONTROLS:\n" +
+                        "- Left Click: Select/Move/Pass. Double Click: Hold. S: Shoot. Space: Advance Phase. \n\n" +
+                        "1. SPRINT\n" +
+                        "   - Starts each quarter. Players line up on defending goal line.\n" +
+                        "   - Roll 1 Die: 1-3 Away Moves, 4-6 Home Moves.\n" +
+                        "   - First to middle hex wins possession.\n\n" +
+                        "2. POSSESSION PHASES\n" +
+                        "   - Gross & Go -> CAP 1 -> CAP 2 -> Half Court.\n" +
+                        "   - Ejected players return after CAP 2 + 6 Half Court Turns.";
+                }
+                else if (currentRulePage == 2)
+                {
+                    ruleText =
+                        "GAME PHASES:\n\n" +
+                        "GROSS & GO\n" +
+                        "   - If Offense/Defense are adjacent on same row: Roll 1 Die.\n" +
+                        "   - 1-3 Away moves, 4-6 Home moves. NO STEALS possible.\n\n" +
+                        "COUNTER ATTACK (CAP 1 & 2)\n" +
+                        "   - Move up to 4 Hexagons. Start with players closest to goal.\n" +
+                        "   - Offense gets 1 chain of unlimited passes.\n\n" +
+                        "HALF COURT\n" +
+                        "   - Alternating turns. Offense moves 1 hex, Defense moves 1 hex.\n" +
+                        "   - 10 Total turns per possession (Shot Clock).";
+                }
+                else if (currentRulePage == 3)
+                {
+                    ruleText =
+                        "PASSING & STEALS:\n\n" +
+                        "AUTOMATIC STEAL\n" +
+                        "   - Defender in direct passing lane.\n" +
+                        "   - Or 2 Defenders adjacent to ball holder (Sandwich).\n\n" +
+                        "PRESSURE PASSING DICE\n" +
+                        "   - PERIMETER: Def closer to goal. Roll 1=Steal, 2-4=Foul, 5-6=Pass.\n" +
+                        "   - INSIDE WATER: Off closer to goal. Roll 1=Steal, 2-4=Eject, 5-6=Pass.\n" +
+                        "   - CREASE: Off on crease. Roll 1=Steal, 2=Foul, 3-4=Eject, 5-6=Pass.\n" +
+                        "   - INSIDE + CREASE: Roll 2-4 = 5-Meter Shot.";
+                }
+                else if (currentRulePage == 4)
+                {
+                    ruleText =
+                        "SHOOTING & SCORING:\n\n" +
+                        "SHOOTING ZONES\n" +
+                        "   - Red: Goal on 2-6.\n" +
+                        "   - Orange: Goal on 3-6.\n" +
+                        "   - Yellow: Goal on 4-6.\n" +
+                        "   - Blue: Goal on 5-6.\n\n" +
+                        "INFLUENCE\n" +
+                        "   - Goalie in Goal Hex: Lowest 'Goal' results become Tip Outs.\n" +
+                        "   - Defender in Lane: Lowest 'Goal' result becomes Field Block.\n\n" +
+                        "AFTER GOAL\n" +
+                        "   - Scored-on team gets ball. Start at Counter Attack Phase 2.";
+                }
+
+                e.Graphics.DrawString(ruleText, new Font("Arial", 16), Brushes.LightGray, 50, 100);
+
+                // Draw Navigation Buttons
+                using (SolidBrush btnBrush = new SolidBrush(Color.Gray))
+                {
+                    if (currentRulePage > 1)
+                    {
+                        e.Graphics.FillRectangle(btnBrush, btnPrevPage);
+                        e.Graphics.DrawString("PREV PAGE", new Font("Arial", 12, FontStyle.Bold), Brushes.Black, btnPrevPage.X + 25, btnPrevPage.Y + 10);
+                    }
+                    if (currentRulePage < MAX_RULE_PAGES)
+                    {
+                        e.Graphics.FillRectangle(btnBrush, btnNextPage);
+                        e.Graphics.DrawString("NEXT PAGE", new Font("Arial", 12, FontStyle.Bold), Brushes.Black, btnNextPage.X + 25, btnNextPage.Y + 10);
+                    }
+                }
+                return;
+            }
+
+            if (currentPhase == Phase.Roster)
+            {
+                e.Graphics.Clear(Color.DarkSlateGray);
+                e.Graphics.DrawString("ROSTER & STATS (Click player on map to Rename)", new Font("Arial", 16, FontStyle.Bold), Brushes.White, 20, 20);
+
+                List<Renderable> renderList = new List<Renderable>();
+                foreach (var kvp in board.Hexes)
+                {
+                    PointF c = HexToPixel3D(kvp.Key);
+                    renderList.Add(new Renderable { ZIndex = c.Y, DrawAction = (g) => DrawHex3D(g, Color.Gray, c.X, c.Y) });
+                }
+                renderList.Sort((a, b) => a.ZIndex.CompareTo(b.ZIndex));
+                foreach (var r in renderList) r.DrawAction(e.Graphics);
+
+                foreach (var p in board.Players)
+                {
+                    PointF c = HexToPixel3D(p.Hex);
+                    Color col = (p.Team == Team.Home) ? Color.Gold : Color.RoyalBlue;
+                    Draw3DChessPiece(e.Graphics, c, col, p.IsGoalie);
+                    if (p == statsSelectedPlayer) { using (Pen pG = new Pen(Color.Lime, 2)) e.Graphics.DrawEllipse(pG, c.X - 20, c.Y - 10, 40, 20); }
+                }
+
+                if (statsSelectedPlayer != null)
+                {
+                    float panelX = 900;
+                    e.Graphics.DrawString($"Editing: {statsSelectedPlayer.Name}", new Font("Arial", 14, FontStyle.Underline), Brushes.White, panelX, 100);
+                    e.Graphics.DrawString($"Goals: {statsSelectedPlayer.StatsGoals}", new Font("Arial", 12), Brushes.LightGreen, panelX, 140);
+                    e.Graphics.DrawString($"Steals: {statsSelectedPlayer.StatsSteals}", new Font("Arial", 12), Brushes.Cyan, panelX, 170);
+                    e.Graphics.DrawString($"Blocks: {statsSelectedPlayer.StatsBlocks}", new Font("Arial", 12), Brushes.Orange, panelX, 200);
+                    e.Graphics.DrawString("(Type to rename)", new Font("Arial", 10, FontStyle.Italic), Brushes.Gray, panelX, 260);
+                }
+                else
+                {
+                    e.Graphics.DrawString("Select a player to view stats.", new Font("Arial", 12), Brushes.White, 900, 100);
+                }
+                return;
+            }
+
+            // --- 3D RENDER ---
+            List<Renderable> drawList = new List<Renderable>();
+
+            foreach (var kvp in board.Hexes)
+            {
+                PointF center = HexToPixel3D(kvp.Key);
+                Color c = Color.FromArgb(100, 255, 255, 255);
+                if (kvp.Value == HexType.GoalHome) c = Color.IndianRed;
+                if (kvp.Value == HexType.GoalAway) c = Color.Teal;
+
+                drawList.Add(new Renderable
+                {
+                    ZIndex = center.Y,
+                    DrawAction = (g) =>
+                    {
+                        DrawHex3D(g, c, center.X, center.Y);
+                        if (kvp.Value.ToString().Contains("Crease")) { using (Pen redPen = new Pen(Color.Red, 2)) g.DrawEllipse(redPen, center.X - 15, center.Y - 10, 30, 20); }
+                        if (highlightedMoves.Contains(kvp.Key)) { using (SolidBrush hb = new SolidBrush(Color.FromArgb(150, 255, 255, 0))) g.FillEllipse(hb, center.X - 15, center.Y - 10, 30, 20); }
+                    }
+                });
+            }
+
+            foreach (var p in board.Players)
+            {
+                PointF center;
+                if (p == animatingPlayer && currentPhase == Phase.Animating && !isAnimatingBall) center = animPos;
+                else center = HexToPixel3D(p.Hex);
+
+                drawList.Add(new Renderable
+                {
+                    ZIndex = center.Y + 1,
+                    DrawAction = (g) =>
+                    {
+                        Color pColor = (p.Team == Team.Home) ? Color.Gold : Color.RoyalBlue;
+                        Draw3DChessPiece(g, center, pColor, p.IsGoalie);
+                        if (p == selectedPlayer) { using (Pen ring = new Pen(Color.Lime, 2)) g.DrawEllipse(ring, center.X - 20, center.Y - 10, 40, 20); }
+                        if (p == board.BallOwner && (!isAnimatingBall || currentPhase != Phase.Animating))
+                        {
+                            g.FillEllipse(Brushes.Gold, center.X + 15, center.Y - 20, 14, 14);
+                            g.DrawEllipse(Pens.Black, center.X + 15, center.Y - 20, 14, 14);
+                        }
+                    }
+                });
+            }
+
+            if (currentPhase == Phase.Animating && isAnimatingBall)
+            {
+                drawList.Add(new Renderable { ZIndex = animPos.Y + 100, DrawAction = (g) => { float h = (float)Math.Sin(animProgress * Math.PI) * 50; g.FillEllipse(Brushes.Gold, animPos.X - 7, animPos.Y - 7 - h, 14, 14); } });
+            }
+
+            drawList.Sort((a, b) => a.ZIndex.CompareTo(b.ZIndex));
+            foreach (var item in drawList) item.DrawAction(e.Graphics);
+
+            DrawScoreboard(e.Graphics);
+            DrawLog(e.Graphics);
+
+            // Dice Overlay
+            if (isDiceRolling)
+            {
+                Rectangle diceRect = new Rectangle(this.Width / 2 - 50, this.Height / 2 - 50, 100, 100);
+                e.Graphics.FillRectangle(Brushes.White, diceRect);
+                e.Graphics.DrawRectangle(new Pen(Color.Black, 3), diceRect);
+                using (Font df = new Font("Arial", 40, FontStyle.Bold))
+                {
+                    SizeF sz = e.Graphics.MeasureString(diceValue.ToString(), df);
+                    e.Graphics.DrawString(diceValue.ToString(), df, Brushes.Black, diceRect.X + (100 - sz.Width) / 2, diceRect.Y + (100 - sz.Height) / 2);
+                }
+                e.Graphics.DrawString("Possibilities: 1-6 or %", new Font("Arial", 10), Brushes.White, diceRect.X, diceRect.Bottom + 5);
+            }
+
+            // Shootout Coin Flip UI
+            if (currentPhase == Phase.ShootoutCoinFlip)
+            {
+                e.Graphics.FillRectangle(Brushes.LightGray, btnHeads); e.Graphics.DrawString("HEADS", new Font("Arial", 12), Brushes.Black, btnHeads.X + 20, btnHeads.Y + 15);
+                e.Graphics.FillRectangle(Brushes.LightGray, btnTails); e.Graphics.DrawString("TAILS", new Font("Arial", 12), Brushes.Black, btnTails.X + 20, btnTails.Y + 15);
+
+                if (message.Contains("Choose"))
+                {
+                    e.Graphics.FillRectangle(Brushes.LightGreen, btnFirst); e.Graphics.DrawString("GO 1ST", new Font("Arial", 12), Brushes.Black, btnFirst.X + 20, btnFirst.Y + 15);
+                    e.Graphics.FillRectangle(Brushes.LightGreen, btnSecond); e.Graphics.DrawString("GO 2ND", new Font("Arial", 12), Brushes.Black, btnSecond.X + 20, btnSecond.Y + 15);
+                }
+            }
+
+            if (!string.IsNullOrEmpty(bigMessage))
+            {
+                Font bigFont = new Font("Arial", 72, FontStyle.Bold);
+                SizeF textSize = e.Graphics.MeasureString(bigMessage, bigFont);
+                e.Graphics.DrawString(bigMessage, bigFont, Brushes.Yellow, (this.Width - textSize.Width) / 2, (this.Height - textSize.Height) / 2);
+                e.Graphics.DrawString(bigMessage, bigFont, Brushes.Black, (this.Width - textSize.Width) / 2 + 2, (this.Height - textSize.Height) / 2 + 2);
+            }
+        }
+
+        private void DrawLog(Graphics g)
+        {
+            Rectangle logRect = new Rectangle(10, this.Height - 200, 300, 180);
+            using (SolidBrush b = new SolidBrush(Color.FromArgb(150, 0, 0, 0))) g.FillRectangle(b, logRect);
+            g.DrawString("GAME LOG (MATH)", new Font("Arial", 10, FontStyle.Bold), Brushes.Yellow, logRect.X + 5, logRect.Y + 5);
+
+            using (Font f = new Font("Consolas", 9))
+            {
+                for (int i = 0; i < gameLog.Count; i++)
+                {
+                    g.DrawString(gameLog[i], f, Brushes.White, logRect.X + 5, logRect.Y + 25 + (i * 18));
+                }
+            }
+        }
+
+        private void Draw3DChessPiece(Graphics g, PointF c, Color color, bool isGoalie)
+        {
+            Color shade = ControlPaint.Dark(color);
+            if (isGoalie)
+            {
+                using (SolidBrush b = new SolidBrush(shade)) g.FillRectangle(b, c.X - 15, c.Y - 10, 30, 10);
+                using (SolidBrush b = new SolidBrush(color)) g.FillEllipse(b, c.X - 15, c.Y - 15, 30, 10);
+                using (SolidBrush b = new SolidBrush(shade)) g.FillRectangle(b, c.X - 12, c.Y - 40, 24, 30);
+                using (SolidBrush b = new SolidBrush(color)) { g.FillRectangle(b, c.X - 15, c.Y - 50, 30, 10); g.FillEllipse(b, c.X - 15, c.Y - 55, 30, 10); }
+                g.DrawEllipse(Pens.Black, c.X - 15, c.Y - 55, 30, 10);
+            }
+            else
+            {
+                using (SolidBrush b = new SolidBrush(shade)) g.FillEllipse(b, c.X - 12, c.Y - 8, 24, 12);
+                PointF[] body = { new PointF(c.X - 10, c.Y - 5), new PointF(c.X + 10, c.Y - 5), new PointF(c.X + 5, c.Y - 35), new PointF(c.X - 5, c.Y - 35) };
+                using (SolidBrush b = new SolidBrush(shade)) g.FillPolygon(b, body);
+                using (SolidBrush b = new SolidBrush(color)) g.FillEllipse(b, c.X - 8, c.Y - 38, 16, 6);
+                using (SolidBrush b = new SolidBrush(color)) g.FillEllipse(b, c.X - 10, c.Y - 50, 20, 20);
+            }
+        }
+
+        private void DrawScoreboard(Graphics g)
+        {
+            Rectangle boardRect = new Rectangle(this.Width / 2 - 200, 10, 400, 80);
+            g.FillRectangle(Brushes.Black, boardRect);
+            g.DrawRectangle(Pens.Gray, boardRect);
+
+            using (Font lblFont = new Font("Arial", 12))
+            using (Font scoreFont = new Font("Arial", 24, FontStyle.Bold))
+            {
+                g.DrawString("HOME", lblFont, Brushes.White, boardRect.X + 20, boardRect.Y + 10);
+                g.DrawString(score[Team.Home].ToString("D2"), scoreFont, Brushes.Red, boardRect.X + 40, boardRect.Y + 35);
+                g.DrawString("AWAY", lblFont, Brushes.White, boardRect.Right - 80, boardRect.Y + 10);
+                g.DrawString(score[Team.Away].ToString("D2"), scoreFont, Brushes.Red, boardRect.Right - 80, boardRect.Y + 35);
+
+                g.DrawString($"Q: {quarter}", lblFont, Brushes.Yellow, boardRect.X + 170, boardRect.Y + 10);
+                g.DrawString($"Clock: {shotClock}", lblFont, Brushes.Orange, boardRect.X + 160, boardRect.Y + 30);
+                g.DrawString($"Poss: {possessionCount}", lblFont, Brushes.Cyan, boardRect.X + 165, boardRect.Y + 50);
+            }
+            g.FillRectangle(Brushes.DarkBlue, this.Width / 2 - 200, 95, 400, 30);
+            StringFormat sf = new StringFormat() { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString(message, new Font("Arial", 10), Brushes.White, new Rectangle(this.Width / 2 - 200, 95, 400, 30), sf);
+        }
+
+        private PointF HexToPixel3D(Point hex)
+        {
+            float x = HEX_SIZE * (3.0f / 2 * hex.X);
+            float y = HEX_SIZE * ((float)Math.Sqrt(3) / 2 * hex.X + (float)Math.Sqrt(3) * hex.Y);
+            return new PointF((x + this.Width / 2), (y * VIEW_TILT + this.Height / 2));
+        }
+
+        private Point PixelToHex3D(float x, float y)
+        {
+            float adjX = x - this.Width / 2;
+            float adjY = (y - this.Height / 2) / VIEW_TILT;
+            float q = (2.0f / 3 * adjX) / HEX_SIZE;
+            float r = (-1.0f / 3 * adjX + (float)Math.Sqrt(3) / 3 * adjY) / HEX_SIZE;
+            return HexRound(q, r);
+        }
+
+        private void DrawHex3D(Graphics g, Color topColor, float x, float y)
+        {
+            PointF[] topFace = new PointF[6];
+            PointF[] bottomFace = new PointF[6];
+            for (int i = 0; i < 6; i++)
+            {
+                double angle = 60 * i;
+                double rad = Math.PI / 180 * angle;
+                float px = (float)(HEX_SIZE * Math.Cos(rad));
+                float py = (float)(HEX_SIZE * Math.Sin(rad)) * VIEW_TILT;
+                topFace[i] = new PointF(x + px, y + py);
+                bottomFace[i] = new PointF(x + px, y + py + TILE_DEPTH);
+            }
+            using (SolidBrush sideBrush = new SolidBrush(ControlPaint.Dark(topColor)))
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    int next = (i + 1) % 6;
+                    PointF[] sidePoly = { topFace[i], topFace[next], bottomFace[next], bottomFace[i] };
+                    g.FillPolygon(sideBrush, sidePoly);
+                }
+            }
+            using (SolidBrush topBrush = new SolidBrush(topColor)) g.FillPolygon(topBrush, topFace);
+            g.DrawPolygon(Pens.LightGray, topFace);
+        }
+
+        private Point HexRound(float x, float y)
+        {
+            float z = -x - y;
+            int rx = (int)Math.Round(x);
+            int ry = (int)Math.Round(y);
+            int rz = (int)Math.Round(z);
+            if (Math.Abs(rx - x) > Math.Abs(ry - y) && Math.Abs(rx - x) > Math.Abs(rz - z)) rx = -ry - rz;
+            else if (Math.Abs(ry - y) > Math.Abs(rz - z)) ry = -rx - rz;
+            return new Point(rx, ry);
+        }
+    }
+}
